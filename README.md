@@ -58,9 +58,9 @@ Lambda Function 2: **org.example.spring.lambda.case2.LambdaTwoHandler**
 
 **Trigger Lambda Function 1  and Trigger Lambda Function 2**
 
-curl -X POST https://<api-gateway-endpoint>/operation1?operation=fetchData
+curl -X POST https://api-gateway-endpoint.com/operation1?operation=fetchData
 
-curl -X POST https://<api-gateway-endpoint>/operation2?operation=uploadFile
+curl -X POST https://api-gateway-endpoint.com/operation2?operation=uploadFile
 
 **Note**
 
