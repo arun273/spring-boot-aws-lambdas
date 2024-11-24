@@ -98,3 +98,36 @@ curl -X POST https://api-gateway-endpoint.com/file -d '{"operation":"download", 
 **Note**
 
 This implementation provides a clean, modular, and efficient way to handle the described use case.
+
+**-------------------------------------------------------------------------------------------------------------**
+
+**Deployment of package: org.example.spring.lambda.case4**
+
+mvn clean package
+
+Upload to AWS Lambda:
+
+**Create two Lambda functions**
+
+Upload URL Function: **org.example.spring.lambda.case4.UploadUrlHandler**
+
+Download URL Function: **org.example.spring.lambda.case4.DownloadUrlHandler**
+
+**Set up API Gateway &  Create two routes in API Gateway, each pointing to one of the Lambda functions**
+
+/upload-url → UploadUrlHandler
+
+/download-url → DownloadUrlHandler
+
+
+**Example Requests -  Generate Upload Pre-Signed URL & Generate Download Pre-Signed UR**
+
+curl -X GET "https://api-gateway-endpoint.com/upload-url?fileName=test.pdf"
+
+curl -X GET "https://api-gateway-endpoint.com/download-url?fileName=test.pdf"
+
+**Note**
+
+This setup ensures that the Lambda functions are independently targeted by API Gateway and perform their respective tasks (upload/download URL generation) without relying on path-based routing or Spring context.
+
+
