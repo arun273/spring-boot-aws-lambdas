@@ -36,7 +36,7 @@ curl -X GET https://api-gateway-endpoint.com/s3?operation=download&fileName=test
 
 **Note**
 
-This design ensures that each Lambda function operates independently and handles distinct responsibilities while being deployed from the same JAR. Let me know if further clarification or enhancements are needed!
+This design ensures that each Lambda function operates independently and handles distinct responsibilities while being deployed from the same JAR.
 
 **-------------------------------------------------------------------------------------------------------------**
 
@@ -64,7 +64,7 @@ curl -X POST https://<api-gateway-endpoint>/operation2?operation=uploadFile
 
 **Note**
 
-This approach allows each Lambda function to be independently targeted by AWS API Gateway without relying on Spring context or path-based routing. Let me know if you'd like further assistance!
+This approach allows each Lambda function to be independently targeted by AWS API Gateway without relying on Spring context or path-based routing.
 
 **-------------------------------------------------------------------------------------------------------------**
 
