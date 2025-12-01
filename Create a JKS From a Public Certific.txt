@@ -1,0 +1,965 @@
+Create a JKS From a Public Certificate
+
+Assume you have a public cert:
+
+server.crt or server.pem
+
+No private key → will be a truststore (trusted cert entry)
+
+✔ Create an empty JKS and import cert
+
+keytool -importcert \
+  -alias external-api \
+  -file server.pem \
+  -keystore truststore.jks \
+  -storepass changeit
+
+
+✔ Import additional public certs
+
+keytool -importcert \
+  -alias api2 \
+  -file another-cert.pem \
+  -keystore truststore.jks \
+  -storepass changeit
+
+✔ List entries
+
+keytool -list -v -keystore truststore.jks
+
+
+2️⃣ Place truststore in Spring Boot Resources
+
+src/main/resources/security/truststore.jks
+
+
+3️⃣ Load JKS & Build SSLContext (Spring Boot 3 / Java 17)
+
+
+@Configuration
+public class SSLConfig {
+
+    @Value("${custom.ssl.truststore}")
+    private Resource trustStore;
+
+    @Value("${custom.ssl.truststore-password}")
+    private String trustStorePassword;
+
+    @Value("${custom.proxy.host}")
+    private String proxyHost;
+
+    @Value("${custom.proxy.port}")
+    private int proxyPort;
+
+    @Bean
+    public HttpClient httpClient() throws Exception {
+        // Load TrustStore
+        KeyStore truststore = KeyStore.getInstance("JKS");
+        try (InputStream is = trustStore.getInputStream()) {
+            truststore.load(is, trustStorePassword.toCharArray());
+        }
+
+        // Build TrustManager
+        SSLContext sslContext = SSLContexts.custom()
+                .loadTrustMaterial(truststore, null)
+                .build();
+
+        // Configure Proxy
+        HttpHost proxy = new HttpHost(proxyHost, proxyPort);
+
+        return HttpClients.custom()
+                .setSSLContext(sslContext)
+                .setProxy(proxy)
+                .build();
+    }
+
+    @Bean
+    public RestTemplate restTemplate(HttpClient httpClient) {
+        HttpComponentsClientHttpRequestFactory requestFactory =
+                new HttpComponentsClientHttpRequestFactory(httpClient);
+
+        return new RestTemplate(requestFactory);
+    }
+}
+
+
+4️⃣ Spring Boot Application Configuration
+
+
+custom.ssl.truststore=classpath:security/truststore.jks
+custom.ssl.truststore-password=changeit
+
+custom.proxy.host=proxy.mycompany.com
+custom.proxy.port=8080
+
+5️⃣ Make API Call Using RestTemplate
+
+@Service
+public class ExternalApiService {
+
+    private final RestTemplate restTemplate;
+
+    public ExternalApiService(RestTemplate restTemplate) {
+        this.restTemplate = restTemplate;
+    }
+
+    public String callApi() {
+        String url = "https://external-secure-api.com/data";
+        return restTemplate.getForObject(url, String.class);
+    }
+}
+
+
+6️⃣ Optional: Using Spring WebClient Instead of RestTemplate
+SSLContext + Proxy Support in WebClient (Reactor Netty)
+
+
+@Configuration
+public class WebClientSSLConfig {
+
+    @Bean
+    public WebClient webClient(
+            @Value("${custom.ssl.truststore}") Resource trustStore,
+            @Value("${custom.ssl.truststore-password}") String password,
+            @Value("${custom.proxy.host}") String proxyHost,
+            @Value("${custom.proxy.port}") Integer proxyPort
+    ) throws Exception {
+
+        KeyStore ks = KeyStore.getInstance("JKS");
+        try (InputStream is = trustStore.getInputStream()) {
+            ks.load(is, password.toCharArray());
+        }
+
+        TrustManagerFactory tmf = TrustManagerFactory.getInstance(
+                TrustManagerFactory.getDefaultAlgorithm()
+        );
+        tmf.init(ks);
+
+        SslContext sslContext = SslContextBuilder.forClient()
+                .trustManager(tmf)
+                .build();
+
+        HttpClient httpClient = HttpClient.create()
+                .proxy(proxy -> proxy
+                        .type(ProxyProvider.Proxy.HTTP)
+                        .host(proxyHost)
+                        .port(proxyPort))
+                .secure(ssl -> ssl.sslContext(sslContext));
+
+        return WebClient.builder()
+                .clientConnector(new ReactorClientHttpConnector(httpClient))
+                .build();
+    }
+}
+
+
+Usage
+
+@Service
+public class ExternalApiWebClient {
+
+    private final WebClient client;
+
+    public ExternalApiWebClient(WebClient client) {
+        this.client = client;
+    }
+
+    public Mono<String> callSecureApi() {
+        return client.get()
+                .uri("https://external-secure-api.com/data")
+                .retrieve()
+                .bodyToMono(String.class);
+    }
+}
+
+
+
+ code should handle exceptions with correct http status code 
+
+Below is a clean, production-ready Spring Boot pattern where your API client code (RestTemplate/WebClient) handles exceptions and maps them to correct HTTP status codes, and your controller returns proper error responses.
+
+This includes:
+
+✔ Centralized Exception Model
+✔ Custom Exceptions for Upstream API Failures
+✔ Mapping Exceptions → Correct HTTP status codes
+✔ RestTemplate and WebClient examples
+
+
+✅ 1. Create Standard Error Response Model
+
+
+public record ApiErrorResponse(
+        String message,
+        int status,
+        String error
+) {}
+
+✅ 2. Define Custom Exceptions for Upstream API Calls  Example: Upstream API sends 400, 404, 500, etc.We map them into meaningful exceptions.
+
+public class ExternalApiException extends RuntimeException {
+    private final int statusCode;
+
+    public ExternalApiException(String message, int statusCode) {
+        super(message);
+        this.statusCode = statusCode;
+    }
+
+    public int getStatusCode() {
+        return statusCode;
+    }
+}
+
+✅ 3. Centralized Exception Handler (Global)
+
+
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(ExternalApiException.class)
+    public ResponseEntity<ApiErrorResponse> handleExternal(ExternalApiException ex) {
+        ApiErrorResponse body = new ApiErrorResponse(
+                ex.getMessage(),
+                ex.getStatusCode(),
+                HttpStatus.valueOf(ex.getStatusCode()).name()
+        );
+        return ResponseEntity.status(ex.getStatusCode()).body(body);
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ApiErrorResponse> handleGeneral(Exception ex) {
+        ApiErrorResponse body = new ApiErrorResponse(
+                "Internal Server Error",
+                HttpStatus.INTERNAL_SERVER_ERROR.value(),
+                HttpStatus.INTERNAL_SERVER_ERROR.name()
+        );
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(body);
+    }
+}
+
+✅ 4. RestTemplate Client with Exception Translation  -Catch upstream errors → convert to ExternalApiException.
+
+@Service
+public class ExternalApiClient {
+
+    private final RestTemplate restTemplate;
+
+    public ExternalApiClient(RestTemplate restTemplate) {
+        this.restTemplate = restTemplate;
+    }
+
+    public String callExternal() {
+        String url = "https://external-secure-api.com/data";
+
+        try {
+            return restTemplate.getForObject(url, String.class);
+        } catch (HttpStatusCodeException ex) {
+            // Map upstream status to GlobalExceptionHandler
+            throw new ExternalApiException(
+                    "External API error: " + ex.getResponseBodyAsString(),
+                    ex.getStatusCode().value()
+            );
+        } catch (Exception ex) {
+            throw new ExternalApiException(
+                    "Unknown error calling external API",
+                    HttpStatus.INTERNAL_SERVER_ERROR.value()
+            );
+        }
+    }
+}
+
+✅ 5. WebClient Client with Exception Translation
+
+@Service
+public class ExternalApiWebClient {
+
+    private final WebClient webClient;
+
+    public ExternalApiWebClient(WebClient webClient) {
+        this.webClient = webClient;
+    }
+
+    public Mono<String> callExternal() {
+        return webClient.get()
+                .uri("https://external-secure-api.com/data")
+                .retrieve()
+                .onStatus(
+                        HttpStatusCode::isError,
+                        response -> response.bodyToMono(String.class)
+                                .flatMap(body -> Mono.error(
+                                        new ExternalApiException(
+                                                "External API error: " + body,
+                                                response.statusCode().value()
+                                        )
+                                ))
+                )
+                .bodyToMono(String.class)
+                .onErrorResume(ex -> {
+                    if (ex instanceof ExternalApiException e) {
+                        return Mono.error(e); // handled by controller advice
+                    }
+                    return Mono.error(new ExternalApiException(
+                            "Unknown WebClient error",
+                            HttpStatus.INTERNAL_SERVER_ERROR.value()
+                    ));
+                });
+    }
+}
+
+✅ 6. Controller Demonstrating Exception Handling
+
+
+@RestController
+@RequestMapping("/api")
+public class TestController {
+
+    private final ExternalApiClient apiClient;
+
+    public TestController(ExternalApiClient apiClient) {
+        this.apiClient = apiClient;
+    }
+
+    @GetMapping("/call")
+    public ResponseEntity<String> callExternal() {
+        String response = apiClient.callExternal();
+        return ResponseEntity.ok(response);
+    }
+}
+
+
+
+Mainly looking to hit DNS to see success or failure 
+
+✅ 1. DNS Check With Timeout (Synchronous)
+
+Java's default DNS resolution has no timeout.This version gives you a controlled timeout using ExecutorService.
+
+
+public class DnsResolver {
+
+    private static final ExecutorService executor = Executors.newSingleThreadExecutor();
+
+    public static boolean resolveWithTimeout(String hostname, int timeoutMillis) {
+        Future<Boolean> future = executor.submit(() -> {
+            try {
+                InetAddress.getByName(hostname);
+                return true;
+            } catch (UnknownHostException e) {
+                return false;
+            }
+        });
+
+        try {
+            return future.get(timeoutMillis, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            future.cancel(true);
+            return false; // timed out
+        } catch (Exception e) {
+            return false;
+        }
+    }
+}
+
+
+Usage:
+boolean ok = DnsResolver.resolveWithTimeout("google.com", 2000);
+
+
+
+
+✅ 2. DNS Check Through Proxy (HTTP/HTTPS Proxy)
+
+DNS itself does not go through HTTP proxies, but if your requirement is:
+
+“Can I verify DNS by routing the test through a proxy?”
+
+Then the only correct way is to perform a HEAD request to the host via proxy and interpret:
+
+DNS failed → proxy returns Could not resolve hostname
+
+Host unreachable → 502/503
+
+Success → 200/301/302/etc.
+
+Using Apache HttpClient 5 (Java 17 compatible)
+
+public class ProxyDnsCheck {
+
+    public static boolean check(String host, String proxyHost, int proxyPort) {
+        HttpHost proxy = new HttpHost(proxyHost, proxyPort);
+
+        try (CloseableHttpClient client = HttpClients.custom()
+                .setProxy(proxy)
+                .build()) {
+
+            HttpGet request = new HttpGet("https://" + host);
+            request.setMethod("HEAD"); // We only want DNS check
+
+            try (CloseableHttpResponse response = client.execute(request)) {
+                return true; // If we reached host, DNS resolved
+            }
+        } catch (UnknownHostException e) {
+            return false; // DNS failure
+        } catch (Exception e) {
+            return false;
+        }
+    }
+}
+
+Usage:
+
+
+boolean ok = ProxyDnsCheck.check("google.com", "proxy.mycompany.com", 8080);
+
+
+
+
+Looking with web client with perfect non blocking 
+
+
+✅ Load SSLContext from JKS
+✅ Use corporate proxy (host + port)
+✅ Perform a DNS check through HTTPS using HEAD
+✅ Be fully reactive & non-blocking (NO blocking calls)
+✅ Return a Mono<Boolean> or structured response
+
+
+
+✅ 1. Load JKS → Build Reactive SSLContext (Netty)
+
+
+@Configuration
+public class WebClientDnsConfig {
+
+    @Value("${custom.ssl.truststore}")
+    private Resource trustStore;
+
+    @Value("${custom.ssl.truststore-password}")
+    private String password;
+
+    @Value("${custom.proxy.host}")
+    private String proxyHost;
+
+    @Value("${custom.proxy.port}")
+    private Integer proxyPort;
+
+    @Bean
+    public WebClient dnsWebClient() throws Exception {
+
+        // 1. Load JKS TrustStore
+        KeyStore ks = KeyStore.getInstance("JKS");
+        try (InputStream is = trustStore.getInputStream()) {
+            ks.load(is, password.toCharArray());
+        }
+
+        TrustManagerFactory tmf = TrustManagerFactory.getInstance(
+                TrustManagerFactory.getDefaultAlgorithm()
+        );
+        tmf.init(ks);
+
+        // 2. Build Netty SslContext
+        SslContext sslContext = SslContextBuilder.forClient()
+                .trustManager(tmf)
+                .build();
+
+        // 3. Configure Proxy + SSL for Reactor Netty HttpClient
+        HttpClient httpClient = HttpClient.create()
+                .proxy(proxy -> proxy
+                        .type(ProxyProvider.Proxy.HTTP)
+                        .host(proxyHost)
+                        .port(proxyPort))
+                .secure(ssl -> ssl.sslContext(sslContext));
+
+        // 4. Build WebClient (non-blocking)
+        return WebClient.builder()
+                .clientConnector(new ReactorClientHttpConnector(httpClient))
+                .build();
+    }
+}
+
+✅ 2. Non-Blocking DNS Check using WebClient (Mono)
+
+Logic:
+
+Perform a lightweight HEAD to https://<hostname>
+
+If DNS resolution fails:
+
+Proxy returns an error OR
+
+Reactive pipeline throws an error
+
+We map errors → Mono.just(false)
+
+@Service
+public class ReactiveDnsCheckService {
+
+    private final WebClient webClient;
+
+    public ReactiveDnsCheckService(WebClient dnsWebClient) {
+        this.webClient = dnsWebClient;
+    }
+
+    public Mono<Boolean> checkDns(String hostname) {
+
+        String url = "https://" + hostname;
+
+        return webClient
+                .head()
+                .uri(url)
+                .retrieve()
+                .toBodilessEntity()
+                .map(response -> true) // success = DNS resolved
+                .onErrorResume(ex -> {
+                    // If DNS failed, proxy says: unknown host
+                    if (ex.getMessage() != null &&
+                            ex.getMessage().contains("UnknownHost")) {
+                        return Mono.just(false);
+                    }
+                    return Mono.just(false);
+                });
+    }
+}
+
+
+🟦 3. Controller (Non-blocking Response)
+
+@RestController
+@RequestMapping("/network")
+public class ReactiveDnsController {
+
+    private final ReactiveDnsCheckService dnsService;
+
+    public ReactiveDnsController(ReactiveDnsCheckService dnsService) {
+        this.dnsService = dnsService;
+    }
+
+    @GetMapping("/dns-check")
+    public Mono<ResponseEntity<String>> check(@RequestParam String host) {
+        return dnsService.checkDns(host)
+                .map(success -> success
+                        ? ResponseEntity.ok("DNS OK: " + host)
+                        : ResponseEntity.badRequest().body("DNS FAILED: " + host)
+                );
+    }
+}
+
+
+Great — here is the full, reusable, production-ready WebClient DNS Utility Library you asked for.
+
+This version includes:
+
+✔ Perfect non-blocking Mono
+✔ SSLContext from JKS truststore
+✔ Proxy support
+✔ Timeout support (reactive)
+✔ Retry with backoff (reactor retry)
+✔ Reusable DNSClient interface
+✔ Spring Boot auto-wiring
+
+This is clean enough to package as a micro library/module.
+
+📦 1. Package Structure (Recommended)
+com.yourcompany.network.dns
+    ├── DnsClient.java
+    ├── DnsClientConfig.java
+    ├── ReactiveDnsClient.java
+    ├── DnsClientProperties.java
+    ├── DnsClientAutoConfig.java
+    └── model
+         └── DnsResult.java
+
+
+🟩 2. DnsResult (Response Model)
+
+package com.yourcompany.network.dns.model;
+
+public record DnsResult(
+        boolean success,
+        String hostname,
+        String message
+) {}
+
+
+
+🟦 3. DnsClient Interface (Non-blocking)
+
+package com.yourcompany.network.dns;
+
+import com.yourcompany.network.dns.model.DnsResult;
+import reactor.core.publisher.Mono;
+
+public interface DnsClient {
+    Mono<DnsResult> check(String hostname);
+}
+🟨 4. Properties Class (Spring Boot Friendly)
+
+package com.yourcompany.network.dns;
+
+import org.springframework.boot.context.properties.ConfigurationProperties;
+
+@ConfigurationProperties(prefix = "dns.client")
+public record DnsClientProperties(
+        String truststorePath,
+        String truststorePassword,
+        String proxyHost,
+        int proxyPort,
+        int timeoutMillis,
+        int retryCount,
+        int retryBackoffMillis
+) {}
+
+🟧 5. Spring Boot Auto-Configuration (Loads JKS + Proxy + WebClient)
+
+package com.yourcompany.network.dns;
+
+import com.yourcompany.network.dns.model.DnsResult;
+import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslContextBuilder;
+import jakarta.annotation.PostConstruct;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.io.Resource;
+import org.springframework.http.client.reactive.ReactorClientHttpConnector;
+import org.springframework.util.ResourceUtils;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.netty.http.client.HttpClient;
+
+import javax.net.ssl.TrustManagerFactory;
+import java.io.InputStream;
+import java.security.KeyStore;
+
+@Configuration
+@EnableConfigurationProperties(DnsClientProperties.class)
+public class DnsClientAutoConfig {
+
+    @Bean
+    public WebClient dnsWebClient(DnsClientProperties props) throws Exception {
+
+        // 1. Load JKS truststore
+        Resource resource = ResourceUtils.getURL(props.truststorePath()).openConnection().getInputStream() instanceof InputStream inputStream ?
+                null : null;
+
+        KeyStore ks = KeyStore.getInstance("JKS");
+        try (InputStream is = ResourceUtils.getURL(props.truststorePath()).openStream()) {
+            ks.load(is, props.truststorePassword().toCharArray());
+        }
+
+        TrustManagerFactory tmf = TrustManagerFactory.getInstance(
+                TrustManagerFactory.getDefaultAlgorithm()
+        );
+        tmf.init(ks);
+
+        // 2. Build reactive SSLContext
+        SslContext sslContext = SslContextBuilder.forClient()
+                .trustManager(tmf)
+                .build();
+
+        // 3. Configure Reactor Netty proxy + SSL
+        HttpClient httpClient = HttpClient.create()
+                .proxy(proxy -> proxy
+                        .type(reactor.netty.transport.ProxyProvider.Proxy.HTTP)
+                        .host(props.proxyHost())
+                        .port(props.proxyPort()))
+                .secure(ssl -> ssl.sslContext(sslContext));
+
+        return WebClient.builder()
+                .clientConnector(new ReactorClientHttpConnector(httpClient))
+                .build();
+    }
+
+    @Bean
+    public DnsClient dnsClient(WebClient dnsWebClient, DnsClientProperties props) {
+        return new ReactiveDnsClient(dnsWebClient, props);
+    }
+}
+
+🟥 6. Reactive DNS Client Implementation (Non-blocking + Timeout + Retry)
+
+
+package com.yourcompany.network.dns;
+
+import com.yourcompany.network.dns.model.DnsResult;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Mono;
+import reactor.util.retry.Retry;
+
+import java.time.Duration;
+
+public class ReactiveDnsClient implements DnsClient {
+
+    private final WebClient webClient;
+    private final DnsClientProperties props;
+
+    public ReactiveDnsClient(WebClient webClient, DnsClientProperties props) {
+        this.webClient = webClient;
+        this.props = props;
+    }
+
+    @Override
+    public Mono<DnsResult> check(String hostname) {
+
+        String url = "https://" + hostname;
+
+        return webClient
+                .head()
+                .uri(url)
+                .retrieve()
+                .toBodilessEntity()
+                .map(resp -> new DnsResult(true, hostname, "DNS OK"))
+                .timeout(Duration.ofMillis(props.timeoutMillis()))
+                .retryWhen(Retry.backoff(
+                        props.retryCount(),
+                        Duration.ofMillis(props.retryBackoffMillis())
+                ))
+                .onErrorResume(ex ->
+                        Mono.just(new DnsResult(false, hostname,
+                                "DNS Failed: " + ex.getMessage()))
+                );
+    }
+}
+
+🟦 7. Application Properties Example
+
+dns.client.truststore-path=classpath:security/truststore.jks
+dns.client.truststore-password=changeit
+dns.client.proxy-host=proxy.mycompany.com
+dns.client.proxy-port=8080
+dns.client.timeout-millis=3000
+dns.client.retry-count=1
+dns.client.retry-backoff-millis=500
+
+🟩 8. Example Controller
+
+@RestController
+@RequestMapping("/network")
+public class DnsCheckController {
+
+    private final DnsClient dnsClient;
+
+    public DnsCheckController(DnsClient dnsClient) {
+        this.dnsClient = dnsClient;
+    }
+
+    @GetMapping("/dns-check")
+    public Mono<ResponseEntity<DnsResult>> check(@RequestParam String host) {
+        return dnsClient.check(host)
+                .map(result ->
+                        result.success()
+                                ? ResponseEntity.ok(result)
+                                : ResponseEntity.badRequest().body(result)
+                );
+    }
+}
+
+
+
+🟩 5. Auto-Configuration (Dynamic JKS Loading + WebClient Builder)
+
+
+This loads JKS from:
+
+classpath:security/my.jks
+
+or /opt/app/ssl/my.jks
+
+or file:/home/user/my.jks
+
+package com.yourcompany.network.dns;
+
+import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslContextBuilder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.io.ResourceLoader;
+import org.springframework.http.client.reactive.ReactorClientHttpConnector;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.netty.http.client.HttpClient;
+
+import javax.net.ssl.TrustManagerFactory;
+import java.io.InputStream;
+import java.security.KeyStore;
+
+@Configuration
+@EnableConfigurationProperties(DnsClientProperties.class)
+public class DnsClientAutoConfig {
+
+    private static final Logger log = LoggerFactory.getLogger(DnsClientAutoConfig.class);
+
+    @Bean
+    public WebClient dnsWebClient(DnsClientProperties props, ResourceLoader loader) throws Exception {
+
+        log.info("Loading truststore from: {}", props.truststorePath());
+
+        KeyStore ks = KeyStore.getInstance("JKS");
+        try (InputStream is = loader.getResource(props.truststorePath()).getInputStream()) {
+            ks.load(is, props.truststorePassword().toCharArray());
+        }
+
+        TrustManagerFactory tmf = TrustManagerFactory.getInstance(
+                TrustManagerFactory.getDefaultAlgorithm()
+        );
+        tmf.init(ks);
+
+        SslContext sslContext = SslContextBuilder.forClient()
+                .trustManager(tmf)
+                .build();
+
+        HttpClient httpClient = HttpClient.create()
+                .proxy(proxy -> proxy
+                        .type(reactor.netty.transport.ProxyProvider.Proxy.HTTP)
+                        .host(props.proxyHost())
+                        .port(props.proxyPort()))
+                .secure(ssl -> ssl.sslContext(sslContext));
+
+        log.info("DNS WebClient created with proxy {}:{}", props.proxyHost(), props.proxyPort());
+
+        return WebClient.builder()
+                .clientConnector(new ReactorClientHttpConnector(httpClient))
+                .build();
+    }
+
+    @Bean
+    public DnsClient dnsClient(WebClient dnsWebClient, DnsClientProperties props) {
+        return new ReactiveDnsClient(dnsWebClient, props);
+    }
+}
+
+
+🟥 6. Production-Grade Reactive DNS Client Implementation
+
+🔥 Key Features:
+
+Info/debug/error logging
+
+Dynamic URL generation for DNS vs endpoint test
+
+Retry + backoff
+
+Timeout
+
+Distinguishes handshake issues, unknown host, proxy failure
+
+package com.yourcompany.network.dns;
+
+import com.yourcompany.network.dns.model.DnsResult;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Mono;
+import reactor.util.retry.Retry;
+
+import java.net.URI;
+import java.time.Duration;
+
+public class ReactiveDnsClient implements DnsClient {
+
+    private static final Logger log = LoggerFactory.getLogger(ReactiveDnsClient.class);
+
+    private final WebClient webClient;
+    private final DnsClientProperties props;
+
+    public ReactiveDnsClient(WebClient webClient, DnsClientProperties props) {
+        this.webClient = webClient;
+        this.props = props;
+    }
+
+    // ------------------------------------------
+    // HOST ONLY DNS CHECK
+    // ------------------------------------------
+    @Override
+    public Mono<DnsResult> checkHost(String hostname) {
+        return checkInternal("https://" + hostname, hostname);
+    }
+
+    // ------------------------------------------
+    // ENDPOINT CHECK WITH PATH
+    // ------------------------------------------
+    @Override
+    public Mono<DnsResult> checkEndpoint(String url) {
+        String host = URI.create(url).getHost();
+        return checkInternal(url, host);
+    }
+
+    // ------------------------------------------
+    // INTERNAL SHARED CHECK LOGIC
+    // ------------------------------------------
+    private Mono<DnsResult> checkInternal(String url, String host) {
+
+        log.info("Starting DNS/endpoint check for: {}", url);
+
+        return webClient
+                .head()
+                .uri(url)
+                .retrieve()
+                .toBodilessEntity()
+                .map(resp -> {
+                    log.info("DNS OK: {} → HTTP {}", host, resp.getStatusCode().value());
+                    return new DnsResult(true, host, url, null, "SUCCESS");
+                })
+
+                // Timeout
+                .timeout(Duration.ofMillis(props.timeoutMillis()))
+
+                // Retry
+                .retryWhen(
+                        Retry.backoff(
+                                props.retryCount(),
+                                Duration.ofMillis(props.retryBackoffMillis())
+                        ).onRetryExhaustedThrow((spec, sig) -> sig.failure())
+                )
+
+                // Unified exception handling
+                .onErrorResume(ex -> {
+                    String msg = ex.getMessage();
+
+                    log.error("DNS check FAILED for {}: {}", host, msg);
+                    log.debug("Detailed DNS failure stack", ex);
+
+                    String errorType =
+                            msg.contains("UnknownHost") ? "DNS_NOT_RESOLVED"
+                                    : msg.contains("handshake_failure") ? "SSL_HANDSHAKE_FAILED"
+                                    : "CONNECTION_ERROR";
+
+                    return Mono.just(new DnsResult(
+                            false,
+                            host,
+                            url,
+                            errorType,
+                            msg
+                    ));
+                });
+    }
+}
+
+🟦 7. Usage Examples (DNS check + endpoint check)
+
+@RestController
+@RequestMapping("/network")
+public class DnsTestController {
+
+    private final DnsClient dnsClient;
+
+    public DnsTestController(DnsClient dnsClient) {
+        this.dnsClient = dnsClient;
+    }
+
+    @GetMapping("/dns")
+    public Mono<DnsResult> dns(@RequestParam String host) {
+        return dnsClient.checkHost(host);
+    }
+
+    @GetMapping("/endpoint")
+    public Mono<DnsResult> endpoint(@RequestParam String url) {
+        return dnsClient.checkEndpoint(url);
+    }
+}
+
+🟩 8. Dynamic Truststore Loading (runtime)
+
+dns.client.trust
+
